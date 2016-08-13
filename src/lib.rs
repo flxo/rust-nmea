@@ -933,3 +933,36 @@ fn test_parse() {
     assert_eq!(nmea.longitude().unwrap(), -6.303372);
     assert_eq!(nmea.altitude().unwrap(), 61.7);
 }
+
+
+
+
+
+    // const char *sentence = 
+    // struct minmea_sentence_gga frame = {};
+    // static const struct minmea_sentence_gga expected = {
+    //     .time = { 12, 35, 19, 0 },
+    //     .latitude = { 4807038, 1000 },
+    //     .longitude = { 1131000, 1000 },
+    //     .fix_quality = 1,
+    //     .satellites_tracked = 8,
+    //     .hdop = { 9, 10 },
+    //     .altitude = { 5454, 10 },
+    //     .altitude_units = 'M',
+    //     .height = { 469, 10 },
+    //     .height_units = 'M',
+    //     .dgps_age = 0,
+    // };
+
+
+#[test]
+fn test_minema() {
+    let mut nmea = Nmea::new();
+    nmea.parse("$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47").ok();
+    assert_eq!(nmea.latitude().unwrap(), 48.07038);
+    assert_eq!(nmea.longitude().unwrap(), 11.31);
+    assert_eq!(nmea.altitude().unwrap(), 545.4);
+    assert_eq!(nmea.fix_satellites().unwrap(), 8);
+}
+
+
