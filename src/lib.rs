@@ -340,7 +340,7 @@ impl Nmea {
             Err(_) => return false,
         };
         let c = sentence.bytes().fold(0, |c, x| c ^ x);
-        println!("{}: {}", s, c);
+        //println!("{}: {}", s, c);
         c == checksum
     }
 
