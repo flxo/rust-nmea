@@ -18,7 +18,7 @@ extern crate lazy_static;
 extern crate regex;
 extern crate chrono;
 
-use chrono::{DateTime, Timelike, UTC};
+use chrono::naive::time::NaiveTime;
 use regex::Regex;
 use std::collections::HashMap;
 use std::fmt;
@@ -27,7 +27,7 @@ use std::vec::Vec;
 /// NMEA parser
 #[derive(Default)]
 pub struct Nmea {
-    pub fix_timestamp: Option<DateTime<UTC>>,
+    pub fix_timestamp_time: Option<NaiveTime>,
     pub fix_type: Option<FixType>,
     pub latitude: Option<f32>,
     pub longitude: Option<f32>,
@@ -63,8 +63,8 @@ impl<'a> Nmea {
     }
 
     /// Returns fix type
-    pub fn fix_timestamp(&self) -> Option<DateTime<UTC>> {
-        self.fix_timestamp
+    pub fn fix_timestamp_time(&self) -> Option<NaiveTime> {
+        self.fix_timestamp_time
     }
 
     /// Returns fix type
@@ -108,7 +108,7 @@ impl<'a> Nmea {
     }
 
     /// Returns the NMEA sentence type.
-    pub fn sentence_type(&self, s: &'a str) -> Result<SentenceType, &'a str> {
+    pub fn sentence_type(&self, s: &'a str) -> Result<SentenceType, &'static str> {
         match REGEX_TYPE.captures(s) {
             Some(c) => {
                 match c.name("type") {
@@ -126,31 +126,21 @@ impl<'a> Nmea {
     }
 
     /// Parse a HHMMSS string into todays UTC datetime
-    fn parse_hms(s: &'a str) -> Result<DateTime<UTC>, &'a str> {
-        REGEX_HMS.captures(s)
-            .and_then(|caps| {
-                UTC::now()
-                    .with_hour(caps.get(1)
-                        .and_then(|l| Self::parse_numeric::<u32>(l.as_str(), 1).ok())
-                        .unwrap_or(0))
-                    .unwrap()
-                    .with_minute(caps.get(2)
-                        .and_then(|l| Self::parse_numeric::<u32>(l.as_str(), 1).ok())
-                        .unwrap_or(0))
-                    .unwrap()
-                    .with_second(caps.get(3)
-                        .and_then(|l| Self::parse_numeric::<u32>(l.as_str(), 1).ok())
-                        .unwrap_or(0))
-                    .unwrap()
-                    .with_nanosecond(0)
-            })
-            .ok_or("Failed to parse time")
+    fn parse_hms(s: &'a str) -> Result<NaiveTime, &'static str> {
+        if s.len() != 6 {
+            return Err("Failed to parse time");
+        } else {
+            let hour = Self::parse_numeric::<u32>(&s[0..2], 1)?;
+            let min = Self::parse_numeric::<u32>(&s[2..4], 1)?;
+            let sec = Self::parse_numeric::<u32>(&s[4..6], 1)?;
+            Ok(NaiveTime::from_hms(hour, min, sec))
+        }
     }
 
-    fn parse_gga(&mut self, sentence: &'a str) -> Result<SentenceType, &'a str> {
+    fn parse_gga(&mut self, sentence: &'a str) -> Result<SentenceType, &'static str> {
         match REGEX_GGA.captures(sentence) {
             Some(caps) => {
-                self.fix_timestamp = caps.name("timestamp")
+                self.fix_timestamp_time = caps.name("timestamp")
                     .and_then(|t| Self::parse_hms(t.as_str()).ok());
                 self.fix_type = caps.name("fix_type").and_then(|t| Some(FixType::from(t.as_str())));
                 self.latitude = caps.name("lat_dir").and_then(|s| {
@@ -193,7 +183,7 @@ impl<'a> Nmea {
         }
     }
 
-    fn parse_gsv(&mut self, sentence: &'a str) -> Result<SentenceType, &'a str> {
+    fn parse_gsv(&mut self, sentence: &'a str) -> Result<SentenceType, &'static str> {
         match REGEX_GSV.captures(sentence) {
             Some(caps) => {
                 let gnss_type = match caps.name("type") {
@@ -243,7 +233,7 @@ impl<'a> Nmea {
 
     fn parse_satellites(satellites: &'a str,
                         gnss_type: &GnssType)
-                        -> Result<Vec<Satellite>, &'a str> {
+                        -> Result<Vec<Satellite>, &'static str> {
         let mut sats = vec![];
         let mut s = satellites.split(',');
         for _ in 0..3 {
@@ -275,7 +265,7 @@ impl<'a> Nmea {
 
     /// Parse any NMEA sentence and stores the result. The type of sentence
     /// is returnd if implemented and valid.
-    pub fn parse(&mut self, s: &'a str) -> Result<SentenceType, &'a str> {
+    pub fn parse(&mut self, s: &'a str) -> Result<SentenceType, &'static str> {
         if Nmea::checksum(s)? {
             match self.sentence_type(&s)? {
                 SentenceType::GGA => self.parse_gga(s),
@@ -287,7 +277,7 @@ impl<'a> Nmea {
         }
     }
 
-    fn checksum(s: &str) -> Result<bool, &str> {
+    fn checksum(s: &str) -> Result<bool, &'static str> {
         let caps = REGEX_CHECKSUM.captures(s).ok_or("Failed to parse sentence")?;
         let sentence = caps.name(&"sentence").ok_or("Failed to parse sentence")?;
         let checksum =
@@ -299,7 +289,7 @@ impl<'a> Nmea {
         Ok(checksum == sentence.as_str().bytes().fold(0, |c, x| c ^ x))
     }
 
-    fn parse_numeric<T>(input: &'a str, factor: T) -> Result<T, &str>
+    fn parse_numeric<T>(input: &'a str, factor: T) -> Result<T, &'static str>
         where T: std::str::FromStr + std::ops::Mul<Output = T> + Copy
     {
         input.parse::<T>().map(|v| v * factor).map_err(|_| "Failed to parse number")
@@ -316,7 +306,7 @@ impl fmt::Display for Nmea {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f,
                "{}: lat: {} lon: {} alt: {} {:?}",
-               self.fix_timestamp.map(|l| format!("{}", l)).unwrap_or("None".to_owned()),
+               self.fix_timestamp_time.map(|l| format!("{}", l)).unwrap_or("None".to_owned()),
                self.latitude.map(|l| format!("{:3.8}", l)).unwrap_or("None".to_owned()),
                self.longitude.map(|l| format!("{:3.8}", l)).unwrap_or("None".to_owned()),
                self.altitude.map(|l| format!("{:.3}", l)).unwrap_or("None".to_owned()),
@@ -619,9 +609,6 @@ lazy_static! {
     static ref REGEX_GGA: Regex = {
         Regex::new(r"^\$\D\DGGA,(?P<timestamp>\d{6})\.?\d*,(?P<lat>\d+\.\d+),(?P<lat_dir>[NS]),(?P<lon>\d+\.\d+),(?P<lon_dir>[WE]),(?P<fix_type>\d),(?P<fix_satellites>\d+),(?P<hdop>\d+\.\d+),(?P<alt>\d+\.\d+),\D,(?P<geoid_height>\d+\.\d+),\D,,\*([0-9a-fA-F][0-9a-fA-F])").unwrap()
     };
-    static ref REGEX_HMS: Regex = {
-        Regex::new(r"^(?P<hour>\d\d)(?P<minute>\d\d)(?P<second>\d\d)$").unwrap()
-    };
     static ref REGEX_GSV: Regex = {
         Regex::new(r"^\$(?P<type>\D\D)GSV,(?P<number>\d+),(?P<index>\d+),(?P<sat_num>\d+),(?P<sats>.*)\*\d\d$").unwrap()
     };
@@ -683,19 +670,9 @@ fn test_message_type() {
 
 #[test]
 fn test_gga_north_west() {
-    let date = UTC::now()
-        .with_hour(9)
-        .unwrap()
-        .with_minute(27)
-        .unwrap()
-        .with_second(50)
-        .unwrap()
-        .with_nanosecond(0)
-        .unwrap();
-
     let mut nmea = Nmea::new();
     nmea.parse("$GPGGA,092750.000,5321.6802,N,00630.3372,W,1,8,1.03,61.7,M,55.2,M,,*76").unwrap();
-    assert_eq!(nmea.fix_timestamp().unwrap(), date);
+    assert_eq!(nmea.fix_timestamp_time().unwrap(), NaiveTime::from_hms(9, 27, 50));
     assert_eq!(nmea.latitude().unwrap(), 53. + 21.6802 / 60.);
     assert_eq!(nmea.longitude().unwrap(), -(6. + 30.3372 / 60.));
     assert_eq!(nmea.fix_type().unwrap(), FixType::Gps);
@@ -739,8 +716,7 @@ fn test_gga_invalid() {
 fn test_gga_gps() {
     let mut nmea = Nmea::new();
     nmea.parse("$GPGGA,092750.000,5321.6802,S,00630.3372,E,1,8,1.03,61.7,M,55.2,M,,*79").unwrap();
-    let timestamp = nmea.fix_timestamp.unwrap();
-    assert_eq!(::chrono::naive::time::NaiveTime::from_hms_milli(9, 27, 50, 0), timestamp.time());
+    assert_eq!(NaiveTime::from_hms_milli(9, 27, 50, 0), nmea.fix_timestamp_time.unwrap());
     assert_eq!(-(53. + 21.6802 / 60.), nmea.latitude.unwrap());
     assert_eq!(6. + 30.3372 / 60., nmea.longitude.unwrap());
     assert_eq!(nmea.fix_type(), Some(FixType::Gps));
