@@ -18,7 +18,10 @@ extern crate lazy_static;
 extern crate regex;
 extern crate chrono;
 
+use chrono::{DateTime, UTC, Date};
 use chrono::naive::time::NaiveTime;
+use chrono::naive::date::NaiveDate;
+use chrono::naive::datetime::NaiveDateTime;
 use regex::Regex;
 use std::collections::HashMap;
 use std::fmt;
@@ -28,6 +31,7 @@ use std::vec::Vec;
 #[derive(Default)]
 pub struct Nmea {
     pub fix_timestamp_time: Option<NaiveTime>,
+    pub fix_timestamp_date: Option<Date<UTC>>,
     pub fix_type: Option<FixType>,
     pub latitude: Option<f32>,
     pub longitude: Option<f32>,
@@ -35,6 +39,8 @@ pub struct Nmea {
     pub fix_satellites: Option<u32>,
     pub hdop: Option<f32>,
     pub geoid_height: Option<f32>,
+    pub speed_over_ground: Option<f32>,
+    pub true_course: Option<f32>,
     pub satellites: Vec<Satellite>,
     satellites_scan: HashMap<GnssType, Vec<Vec<Satellite>>>,
 }
@@ -268,6 +274,22 @@ impl<'a> Nmea {
     pub fn parse(&mut self, s: &'a str) -> Result<SentenceType, &'static str> {
         if Nmea::checksum(s)? {
             match self.sentence_type(&s)? {
+                SentenceType::RMC => {
+                    let rmc_data = parse_rmc(s)?;
+                    self.fix_timestamp_time = rmc_data.fix_time.map(|v| v.time());
+                    self.fix_timestamp_date = rmc_data.fix_time.map(|v| v.date());
+                    self.fix_type = rmc_data.status_of_fix
+                        .map(|v| match v {
+                            RmcStatusOfFix::Autonomous => FixType::Gps,
+                            RmcStatusOfFix::Differential => FixType::DGps,
+                            RmcStatusOfFix::Invalid => FixType::Invalid,
+                        });
+                    self.latitude = rmc_data.lat;
+                    self.longitude = rmc_data.lon;
+                    self.speed_over_ground = rmc_data.speed_over_ground;
+                    self.true_course = rmc_data.true_course;
+                    Ok(SentenceType::RMC)
+                }
                 SentenceType::GGA => self.parse_gga(s),
                 SentenceType::GSV => self.parse_gsv(s),
                 _ => Err("Unknown or implemented sentence type"),
@@ -294,6 +316,110 @@ impl<'a> Nmea {
     {
         input.parse::<T>().map(|v| v * factor).map_err(|_| "Failed to parse number")
     }
+}
+
+enum RmcStatusOfFix {
+    Autonomous,
+    Differential,
+    Invalid,
+}
+
+struct RmcData {
+    fix_time: Option<DateTime<UTC>>,
+    status_of_fix: Option<RmcStatusOfFix>,
+    lat: Option<f32>,
+    lon: Option<f32>,
+    speed_over_ground: Option<f32>,
+    true_course: Option<f32>,
+}
+
+macro_rules! map_not_empty {
+    ($StrName: ident, $Expr: expr) => {
+        if !$StrName.is_empty() {
+            Some($Expr)
+        } else {
+            None
+        }
+    }
+}
+
+fn parse_rmc(input: &str) -> Result<RmcData, &'static str> {
+    let mut field = input.split(",");
+    if !REGEX_RMC_HEAD.is_match(field.next().ok_or("parse_rmc failed: non RMC type")?) {
+        return Err("Not start with $..RMC");
+    }
+    let time = field.next().ok_or("parse_rmc failed: no time")?;
+    let time: Option<NaiveTime> = map_not_empty!(time, {
+        if time.len() < 6 {
+            return Err("parse_rmc: text field with time too short (< 6 symbols)");
+        } else {
+            let hours = Nmea::parse_numeric::<u8>(&time[0..2], 1)?;
+            let mins = Nmea::parse_numeric::<u8>(&time[2..4], 1)?;
+            let secs = Nmea::parse_numeric::<f32>(&time[4..], 1.0)?;
+            NaiveTime::from_hms_nano(hours as u32, mins as u32, secs.floor() as u32,
+                                      (secs.fract() * 1_000_000_000f32) as u32)
+        }
+    });
+
+    let status_of_fix = field.next().ok_or("parse_rmc failed: no status of fix")?;
+    let status_of_fix = map_not_empty!(status_of_fix, match status_of_fix {
+        "A" => RmcStatusOfFix::Autonomous,
+        "D" => RmcStatusOfFix::Differential,
+        "V" => RmcStatusOfFix::Invalid,
+        _ => { return Err("parse_rmc failed: not A|D|V status of fix"); }
+    });
+
+    let lat = field.next().ok_or("parse_rmc failed: no lattitude")?;
+    let lat_dir = match field.next().ok_or("parse_rmc failed: no lattitude direction")? {
+        "S" => -0.01,
+        "N" => 0.01,
+        _ => { return Err("parse_rmc failed: wrong lat dir, not of S|N"); }
+    };
+    let lat = map_not_empty!(lat, {
+        let num = Nmea::parse_numeric::<f32>(lat, lat_dir)?;
+        num.round() + (num.fract() * 100.0) / 60.
+    });
+
+    let lon = field.next().ok_or("parse_rmc failed: no longitude")?;
+    let lon_dir = match field.next().ok_or("parse_rmc failed: no longitude direction")? {
+        "W" => -0.01,
+        "E" => 0.01,
+        _ => { return Err("parse_rmc failed: wrong lon dir"); }
+    };
+    let lon = map_not_empty!(lon, {
+       let num = Nmea::parse_numeric::<f32>(lon, lon_dir)?;
+        num.round() + (num.fract() * 100.0) / 60.
+    });
+
+
+    let speed_over_ground = field.next().ok_or("parse_rmc failed: no speed over ground")?;
+    let speed_over_ground = map_not_empty!(speed_over_ground, Nmea::parse_numeric::<f32>(speed_over_ground, 1.0)?);
+    let course = field.next().ok_or("parse_rmc failed: no course")?;
+    let course = map_not_empty!(course, Nmea::parse_numeric::<f32>(course, 1.0)?);
+    let date = field.next().ok_or("parse_rmc failed: no date of fix")?;
+    let date: Option<NaiveDate> = map_not_empty!(date, {
+        if date.len() != 6 {
+            return Err("Length string with date of fix not 6");
+        } else {
+            let day =  Nmea::parse_numeric::<u8>(&date[0..2], 1)?;
+            let month = Nmea::parse_numeric::<u8>(&date[2..4], 1)?;
+            let year = Nmea::parse_numeric::<u8>(&date[4..6], 1)?;
+            NaiveDate::from_ymd(year as i32, month as u32, day as u32)
+        }
+    });
+
+    Ok(RmcData {
+        fix_time: if let (Some(date), Some(time)) = (date, time) {
+            Some(DateTime::from_utc(NaiveDateTime::new(date, time), UTC))
+        } else {
+            None
+        },
+        status_of_fix: status_of_fix,
+        lat: lat,
+        lon: lon,
+        speed_over_ground: speed_over_ground,
+        true_course: course,
+    })
 }
 
 impl fmt::Debug for Nmea {
@@ -612,6 +738,9 @@ lazy_static! {
     static ref REGEX_GSV: Regex = {
         Regex::new(r"^\$(?P<type>\D\D)GSV,(?P<number>\d+),(?P<index>\d+),(?P<sat_num>\d+),(?P<sats>.*)\*\d\d$").unwrap()
     };
+    static ref REGEX_RMC_HEAD: Regex = {
+        Regex::new(r"^\$\D\DRMC").unwrap()
+    };
 }
 
 
@@ -778,7 +907,7 @@ fn test_parse() {
     let mut nmea = Nmea::new();
     for s in &sentences {
         let res = nmea.parse(s);
-        if s.starts_with("$GPGSA") || s.starts_with("$GPRMC") {
+        if s.starts_with("$GPGSA") {
             res.unwrap_err();
         } else {
             res.unwrap();
@@ -788,4 +917,27 @@ fn test_parse() {
     assert_eq!(nmea.latitude().unwrap(), 53. + 21.6802 / 60.);
     assert_eq!(nmea.longitude().unwrap(), -(6. + 30.3372 / 60.));
     assert_eq!(nmea.altitude().unwrap(), 61.7);
+}
+
+#[test]
+fn test_parse_rmc() {
+    use chrono::{Datelike, Timelike};
+
+    let rmc_data = parse_rmc("$GPRMC,225446.33,A,4916.45,N,12311.12,W,000.5,054.7,191194,020.3,E,A*68").unwrap();
+    let fix_time = rmc_data.fix_time.unwrap();
+    assert_eq!(94, fix_time.year());
+    assert_eq!(11, fix_time.month());
+    assert_eq!(19, fix_time.day());
+    assert_eq!(22, fix_time.hour());
+    assert_eq!(54, fix_time.minute());
+    assert_eq!(46, fix_time.second());
+    assert_eq!(330, fix_time.nanosecond() / 1_000_000);
+
+    println!("lat: {}", rmc_data.lat.unwrap());
+    assert!((rmc_data.lat.unwrap() - (49.0 + 16.45 / 60.)).abs() < 1e-5);
+    println!("lon: {}, diff {}", rmc_data.lon.unwrap(), (rmc_data.lon.unwrap() + (123.0 + 11.12 / 60.)).abs());
+    assert!((rmc_data.lon.unwrap() + (123.0 + 11.12 / 60.)).abs() < 1e-5);
+
+    assert!((rmc_data.speed_over_ground.unwrap() - 0.5).abs() < 1e-5);
+    assert!((rmc_data.true_course.unwrap() - 54.7).abs() < 1e-5);
 }
