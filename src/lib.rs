@@ -23,9 +23,10 @@ use chrono::naive::time::NaiveTime;
 use chrono::naive::date::NaiveDate;
 use chrono::naive::datetime::NaiveDateTime;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::vec::Vec;
+use std::mem;
 
 /// NMEA parser
 #[derive(Default)]
@@ -43,6 +44,9 @@ pub struct Nmea {
     pub true_course: Option<f32>,
     pub satellites: Vec<Satellite>,
     satellites_scan: HashMap<GnssType, Vec<Vec<Satellite>>>,
+    required_sentences_for_nav: HashSet<SentenceType>,
+    last_fix_time: Option<NaiveTime>,
+    sentences_for_this_time: HashSet<SentenceType>,
 }
 
 #[derive(Debug)]
@@ -76,6 +80,29 @@ impl<'a> Nmea {
         n
     }
 
+    
+    /// Constructs a new `Nmea` for navigation purposes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use nmea::{Nmea, SentenceType};
+    ///
+    /// let mut nmea= Nmea::create_for_navigation([SentenceType::RMC, SentenceType::GGA].iter().map(|v| v.clone()).collect()).unwrap();
+    /// let gga = "$GPGGA,092750.000,5321.6802,N,00630.3372,W,1,8,1.03,61.7,M,55.2,M,,*76";
+    /// nmea.parse(gga).unwrap();
+    /// println!("{}", nmea);
+    /// ```
+    pub fn create_for_navigation(required_sentences_for_nav: HashSet<SentenceType>) -> Result<Nmea, &'static str> {
+        if required_sentences_for_nav.is_empty() {
+            return Err("Should be at least one sentence type in required");
+        }
+        let mut n = Self::new();
+        n.required_sentences_for_nav = required_sentences_for_nav;
+        Ok(n)
+    }
+
+    
     /// Returns fix type
     pub fn fix_timestamp_time(&self) -> Option<NaiveTime> {
         self.fix_timestamp_time
@@ -139,51 +166,141 @@ impl<'a> Nmea {
         }
     }
 
+    fn new_tick(&mut self) {
+        let old = mem::replace(self, Self::default());
+        self.satellites_scan = old.satellites_scan;
+        self.satellites = old.satellites;
+        self.required_sentences_for_nav = old.required_sentences_for_nav;
+        self.last_fix_time = old.last_fix_time;        
+    }
+
+    fn clear_position_info(&mut self) {
+        self.last_fix_time = None;
+        self.new_tick();
+    }
+
+    pub fn parse_for_fix(&mut self, s: &str) -> Result<FixType, &'static str> {
+        match self.do_parse(s)? {
+            ParseResult::GSV(gsv_data) => self.merge_gsv_data(gsv_data)?,
+            ParseResult::RMC(rmc_data) => {
+                match rmc_data.status_of_fix {
+                    Some(RmcStatusOfFix::Invalid) | None => {
+                        self.clear_position_info();
+                        return Ok(FixType::Invalid);
+                    }
+                    _ => {/*nothing*/}
+                }
+                match (self.last_fix_time, rmc_data.fix_time) {
+                    (Some(ref last_fix_time), Some(ref rmc_fix_time)) => {
+                        if *last_fix_time != rmc_fix_time.time() {
+                            self.new_tick();
+                            self.last_fix_time = Some(rmc_fix_time.time());
+                        }
+                    }
+                    (None, Some(ref rmc_fix_time)) => self.last_fix_time = Some(rmc_fix_time.time()),
+                    (Some(_), None) | (None, None) => {
+                        self.clear_position_info();
+                        return Ok(FixType::Invalid);
+                    }
+                }
+                self.merge_rmc_data(rmc_data);
+                self.sentences_for_this_time.insert(SentenceType::RMC);
+            }
+            ParseResult::GGA(gga_data) => {
+                match gga_data.fix_type {
+                    Some(FixType::Invalid) | None => {
+                        self.clear_position_info();
+                        return Ok(FixType::Invalid);
+                    }
+                 _ => {/*nothing*/}
+                }
+                match (self.last_fix_time, gga_data.fix_timestamp_time) {
+                    (Some(ref last_fix_time), Some(ref gga_fix_time)) => {
+                        if last_fix_time != gga_fix_time {
+                            self.new_tick();
+                            self.last_fix_time = Some(*gga_fix_time);
+                        }
+                    }
+                    (None, Some(ref gga_fix_time)) => self.last_fix_time = Some(*gga_fix_time),
+                    (Some(_), None) | (None, None) => {
+                        self.clear_position_info();
+                        return Ok(FixType::Invalid);
+                    }
+                }
+                self.merge_gga_data(gga_data);
+                self.sentences_for_this_time.insert(SentenceType::GGA);
+            }
+            ParseResult::Unsupported(_) => {
+                self.clear_position_info();
+                return Ok(FixType::Invalid);
+            }
+        }
+        match self.fix_type {
+            Some(FixType::Invalid) | None => Ok(FixType::Invalid),
+            Some(ref fix_type) if self.required_sentences_for_nav.is_subset(&self.sentences_for_this_time) =>
+                Ok(fix_type.clone()),
+            _ => Ok(FixType::Invalid),
+        }
+    }
+
+    fn merge_rmc_data(&mut self, rmc_data: RmcData) {
+        self.fix_timestamp_time = rmc_data.fix_time.map(|v| v.time());
+        self.fix_timestamp_date = rmc_data.fix_time.map(|v| v.date());
+        self.fix_type = rmc_data.status_of_fix
+            .map(|v| match v {
+                RmcStatusOfFix::Autonomous => FixType::Gps,
+                RmcStatusOfFix::Differential => FixType::DGps,
+                RmcStatusOfFix::Invalid => FixType::Invalid,
+            });
+        self.latitude = rmc_data.lat;
+        self.longitude = rmc_data.lon;
+        self.speed_over_ground = rmc_data.speed_over_ground;
+        self.true_course = rmc_data.true_course;
+    }
+    
+    fn merge_gsv_data(&mut self, gsv_data: GsvData) -> Result<(), &'static str> {
+        {
+            let d = self.satellites_scan.get_mut(&gsv_data.gnss_type).ok_or("Invalid GNSS type")?;
+            // Adjust size to this scan
+            d.resize(gsv_data.number, vec![]);
+            // Replace data at index with new scan data
+            d.push(gsv_data.sats);
+            d.swap_remove(gsv_data.index - 1);
+        }
+        self.satellites.clear();
+        for (_, v) in &self.satellites_scan {
+            for v1 in v {
+                for v2 in v1 {
+                    self.satellites.push(v2.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_gga_data(&mut self, gga_data: GgaData) {
+        self.fix_timestamp_time = gga_data.fix_timestamp_time;
+        self.latitude = gga_data.latitude;
+        self.longitude = gga_data.longitude;
+        self.fix_type = gga_data.fix_type;
+        self.fix_satellites = gga_data.fix_satellites;
+        self.hdop = gga_data.hdop;
+        self.altitude = gga_data.altitude;
+        self.geoid_height = gga_data.geoid_height;
+    }
+    
     pub fn parse(&mut self, s: &'a str) -> Result<SentenceType, &'static str> {
         match self.do_parse(s)? {
             ParseResult::GGA(gga_data) => {
-                self.fix_timestamp_time = gga_data.fix_timestamp_time;
-                self.latitude = gga_data.latitude;
-                self.longitude = gga_data.longitude;
-                self.fix_type = gga_data.fix_type;
-                self.fix_satellites = gga_data.fix_satellites;
-                self.hdop = gga_data.hdop;
-                self.altitude = gga_data.altitude;
-                self.geoid_height = gga_data.geoid_height;
+                self.merge_gga_data(gga_data);
                 Ok(SentenceType::GGA)
             }
             ParseResult::RMC(rmc_data) => {
-                self.fix_timestamp_time = rmc_data.fix_time.map(|v| v.time());
-                self.fix_timestamp_date = rmc_data.fix_time.map(|v| v.date());
-                self.fix_type = rmc_data.status_of_fix
-                    .map(|v| match v {
-                        RmcStatusOfFix::Autonomous => FixType::Gps,
-                        RmcStatusOfFix::Differential => FixType::DGps,
-                        RmcStatusOfFix::Invalid => FixType::Invalid,
-                    });
-                self.latitude = rmc_data.lat;
-                self.longitude = rmc_data.lon;
-                self.speed_over_ground = rmc_data.speed_over_ground;
-                self.true_course = rmc_data.true_course;
+                self.merge_rmc_data(rmc_data);
                 Ok(SentenceType::RMC)
             }
             ParseResult::GSV(gsv_data) => {
-                {
-                    let d = self.satellites_scan.get_mut(&gsv_data.gnss_type).ok_or("Invalid GNSS type")?;
-                    // Adjust size to this scan
-                    d.resize(gsv_data.number, vec![]);
-                    // Replace data at index with new scan data
-                    d.push(gsv_data.sats);
-                    d.swap_remove(gsv_data.index - 1);
-                }
-                self.satellites.clear();
-                for (_, v) in &self.satellites_scan {
-                    for v1 in v {
-                        for v2 in v1 {
-                            self.satellites.push(v2.clone());
-                        }
-                    }
-                }
+                self.merge_gsv_data(gsv_data)?;
                 Ok(SentenceType::GSV)
             }
             ParseResult::Unsupported(_) => return Err("Unsupported sentence type"),
@@ -563,7 +680,7 @@ impl fmt::Debug for Satellite {
 
 macro_rules! define_sentence_type_enum {
     ($Name:ident { $($Variant:ident),* }) => {
-        #[derive(PartialEq, Debug)]
+        #[derive(PartialEq, Debug, Eq, Hash, Clone)]
         pub enum $Name {
             None,
             $($Variant),*,
@@ -1013,4 +1130,53 @@ fn test_parse_rmc() {
 
     assert!((rmc_data.speed_over_ground.unwrap() - 0.5).abs() < 1e-5);
     assert!((rmc_data.true_course.unwrap() - 54.7).abs() < 1e-5);
+}
+
+#[test]
+fn test_parse_for_fix() {
+    {
+        let mut nmea = Nmea::create_for_navigation([SentenceType::RMC, SentenceType::GGA].iter().map(|v| v.clone()).collect()).unwrap();
+        let log = [
+            ("$GPRMC,123308.2,A,5521.76474,N,03731.92553,E,000.48,071.9,090317,010.2,E,A*3B", FixType::Invalid, Some(NaiveTime::from_hms_milli(12, 33, 8, 200))),
+            ("$GPGGA,123308.2,5521.76474,N,03731.92553,E,1,08,2.2,211.5,M,13.1,M,,*52", FixType::Gps, Some(NaiveTime::from_hms_milli(12, 33, 8, 200))),
+            ("$GPVTG,071.9,T,061.7,M,000.48,N,0000.88,K,A*10", FixType::Invalid, None),
+            ("$GPRMC,123308.3,A,5521.76474,N,03731.92553,E,000.51,071.9,090317,010.2,E,A*32", FixType::Invalid, Some(NaiveTime::from_hms_milli(12, 33, 8, 300))),
+            ("$GPGGA,123308.3,5521.76474,N,03731.92553,E,1,08,2.2,211.5,M,13.1,M,,*53", FixType::Gps, Some(NaiveTime::from_hms_milli(12, 33, 8, 300))),
+            ("$GPVTG,071.9,T,061.7,M,000.51,N,0000.94,K,A*15", FixType::Invalid, None),
+            ("$GPRMC,123308.4,A,5521.76474,N,03731.92553,E,000.54,071.9,090317,010.2,E,A*30", FixType::Invalid, Some(NaiveTime::from_hms_milli(12, 33, 8, 400))),
+            ("$GPGGA,123308.4,5521.76474,N,03731.92553,E,1,08,2.2,211.5,M,13.1,M,,*54", FixType::Gps, Some(NaiveTime::from_hms_milli(12, 33, 8, 400))),
+            ("$GPVTG,071.9,T,061.7,M,000.54,N,0001.00,K,A*1C", FixType::Invalid, None),
+            ("$GPRMC,123308.5,A,5521.76474,N,03731.92553,E,000.57,071.9,090317,010.2,E,A*32", FixType::Invalid, Some(NaiveTime::from_hms_milli(12, 33, 8, 500))),
+            ("$GPGGA,123308.5,5521.76474,N,03731.92553,E,1,08,2.2,211.5,M,13.1,M,,*55", FixType::Gps, Some(NaiveTime::from_hms_milli(12, 33, 8, 500))),
+            ("$GPVTG,071.9,T,061.7,M,000.57,N,0001.05,K,A*1A", FixType::Invalid, None),
+            ("$GPRMC,123308.6,A,5521.76474,N,03731.92553,E,000.58,071.9,090317,010.2,E,A*3E", FixType::Invalid, Some(NaiveTime::from_hms_milli(12, 33, 8, 600))),
+            ("$GPGGA,123308.6,5521.76474,N,03731.92553,E,1,08,2.2,211.5,M,13.1,M,,*56", FixType::Gps, Some(NaiveTime::from_hms_milli(12, 33, 8, 600))),
+            ("$GPVTG,071.9,T,061.7,M,000.58,N,0001.08,K,A*18", FixType::Invalid, None),
+            ("$GPRMC,123308.7,A,5521.76474,N,03731.92553,E,000.59,071.9,090317,010.2,E,A*3E", FixType::Invalid, Some(NaiveTime::from_hms_milli(12, 33, 8, 700))),
+            ("$GPGGA,123308.7,5521.76474,N,03731.92553,E,1,08,2.2,211.5,M,13.1,M,,*57", FixType::Gps, Some(NaiveTime::from_hms_milli(12, 33, 8, 700))),
+            ("$GPVTG,071.9,T,061.7,M,000.59,N,0001.09,K,A*18", FixType::Invalid, None),
+        ];
+
+        for (i, item) in log.iter().enumerate() {
+            let res = nmea.parse_for_fix(item.0).unwrap();
+            println!("parse result({}): {:?}, {:?}", i, res, nmea.fix_timestamp_time);
+            assert_eq!((&res, &nmea.fix_timestamp_time), (&item.1, &item.2));
+        }
+    }
+
+    {
+        let mut nmea = Nmea::create_for_navigation([SentenceType::RMC, SentenceType::GGA].iter().map(|v| v.clone()).collect()).unwrap();
+        let log = [
+            ("$GPRMC,123308.2,A,5521.76474,N,03731.92553,E,000.48,071.9,090317,010.2,E,A*3B", FixType::Invalid, Some(NaiveTime::from_hms_milli(12, 33, 8, 200))),
+            ("$GPRMC,123308.3,A,5521.76474,N,03731.92553,E,000.51,071.9,090317,010.2,E,A*32", FixType::Invalid, Some(NaiveTime::from_hms_milli(12, 33, 8, 300))),
+            ("$GPGGA,123308.3,5521.76474,N,03731.92553,E,1,08,2.2,211.5,M,13.1,M,,*53", FixType::Gps, Some(NaiveTime::from_hms_milli(12, 33, 8, 300))),  
+        ];
+
+        for (i, item) in log.iter().enumerate() {
+            let res = nmea.parse_for_fix(item.0).unwrap();
+            println!("parse result({}): {:?}, {:?}", i, res, nmea.fix_timestamp_time);
+            assert_eq!((&res, &nmea.fix_timestamp_time), (&item.1, &item.2));
+        }
+    }
+    
 }
