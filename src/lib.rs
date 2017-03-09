@@ -45,6 +45,16 @@ pub struct Nmea {
     satellites_scan: HashMap<GnssType, Vec<Vec<Satellite>>>,
 }
 
+macro_rules! map_not_empty {
+    ($StrName: ident, $Expr: expr) => {
+        if !$StrName.is_empty() {
+            Some($Expr)
+        } else {
+            None
+        }
+    }
+}
+
 impl<'a> Nmea {
     /// Constructs a new `Nmea`.
     /// This struct parses NMEA sentences, including checksum checks and sentence
@@ -133,60 +143,64 @@ impl<'a> Nmea {
 
     /// Parse a HHMMSS string into todays UTC datetime
     fn parse_hms(s: &'a str) -> Result<NaiveTime, &'static str> {
-        if s.len() != 6 {
+        if s.len() < 6 {
             return Err("Failed to parse time");
         } else {
             let hour = Self::parse_numeric::<u32>(&s[0..2], 1)?;
             let min = Self::parse_numeric::<u32>(&s[2..4], 1)?;
-            let sec = Self::parse_numeric::<u32>(&s[4..6], 1)?;
-            Ok(NaiveTime::from_hms(hour, min, sec))
+            let sec = Self::parse_numeric::<f64>(&s[4..], 1.0)?;
+            Ok(NaiveTime::from_hms_nano(hour, min, sec.floor() as u32,
+                                     (sec.fract() * 1_000_000_000f64).round() as u32))
         }
     }
 
     fn parse_gga(&mut self, sentence: &'a str) -> Result<SentenceType, &'static str> {
-        match REGEX_GGA.captures(sentence) {
-            Some(caps) => {
-                self.fix_timestamp_time = caps.name("timestamp")
-                    .and_then(|t| Self::parse_hms(t.as_str()).ok());
-                self.fix_type = caps.name("fix_type").and_then(|t| Some(FixType::from(t.as_str())));
-                self.latitude = caps.name("lat_dir").and_then(|s| {
-                    match s.as_str() {
-                        "N" => {
-                            caps.name("lat")
-                                .and_then(|l| Self::parse_numeric::<f32>(l.as_str(), 0.01).ok())
-                        }
-                        "S" => {
-                            caps.name("lat")
-                                .and_then(|l| Self::parse_numeric::<f32>(l.as_str(), -0.01).ok())
-                        }
-                        _ => None,
-                    }.map(|v| v.round() + v.fract() * 100. / 60.)
-                });
-                self.longitude = caps.name("lon_dir").and_then(|s| {
-                    match s.as_str() {
-                        "W" => {
-                            caps.name("lon")
-                                .and_then(|l| Self::parse_numeric::<f32>(l.as_str(), -0.01).ok())
-                        }
-                        "E" => {
-                            caps.name("lon")
-                                .and_then(|l| Self::parse_numeric::<f32>(l.as_str(), 0.01).ok())
-                        }
-                        _ => None,
-                    }.map(|v| v.round() + v.fract() * 100. / 60.)
-                });
-                self.altitude = caps.name("alt")
-                    .and_then(|a| Self::parse_numeric::<f32>(a.as_str(), 1.0).ok());
-                self.fix_satellites = caps.name("fix_satellites")
-                    .and_then(|a| Self::parse_numeric::<u32>(a.as_str(), 1).ok());
-                self.hdop = caps.name("hdop")
-                    .and_then(|a| Self::parse_numeric::<f32>(a.as_str(), 1.0).ok());
-                self.geoid_height = caps.name("geoid_height")
-                    .and_then(|g| Self::parse_numeric::<f32>(g.as_str(), 1.0).ok());
-                Ok(SentenceType::GGA)
-            }
-            None => Err("Failed to parse GGA sentence"),
+        let mut field = sentence.split(",");
+        if !REGEX_GGA_HEAD.is_match(field.next().ok_or("no header")?) {
+            return Err("Not start with $..GGA");
         }
+        let time = field.next().ok_or("no time")?;
+        let time: Option<NaiveTime> = map_not_empty!(time, {
+            Nmea::parse_hms(time)?
+        });
+        let (lat, lon) = parse_lat_lon(&mut field)?;
+        let fix_type = field.next().ok_or("no fix quality")?;
+        let fix_type = map_not_empty!(fix_type, FixType::from(fix_type));
+
+        let fix_satellites = field.next().ok_or("no fix satellites field")?;
+        let fix_satellites = map_not_empty!(fix_satellites,
+                                            Self::parse_numeric::<u32>(fix_satellites, 1)?);
+        let hdop = field.next().ok_or("no hdop feild")?;
+        let hdop = map_not_empty!(hdop, Self::parse_numeric::<f32>(hdop, 1.0)?);
+
+        let altitude = field.next().ok_or("no alt")?;
+        let altitude_type = field.next().ok_or("no alt type")?;
+        let altitude = map_not_empty!(altitude, {
+            if altitude_type != "M" {
+                return Err("no supported altitude type, should be 'M'");
+            }
+            Self::parse_numeric::<f32>(altitude, 1.0)?
+        });
+
+        let geoid_height = field.next().ok_or("no geoid height")?;
+        let geoid_height_type = field.next().ok_or("no geoid height type")?;
+        let geoid_height = map_not_empty!(geoid_height, {
+            if geoid_height_type != "M" {
+                return Err("no supported geoid height type, should be 'M'");
+            }
+            Self::parse_numeric::<f32>(geoid_height, 1.0)?
+        });
+
+        self.fix_timestamp_time = time;
+        self.latitude = lat;
+        self.longitude = lon;
+        self.fix_type = fix_type;
+        self.fix_satellites = fix_satellites;
+        self.hdop = hdop;
+        self.altitude = altitude;
+        self.geoid_height = geoid_height;
+
+        Ok(SentenceType::GGA)
     }
 
     fn parse_gsv(&mut self, sentence: &'a str) -> Result<SentenceType, &'static str> {
@@ -333,16 +347,6 @@ struct RmcData {
     true_course: Option<f32>,
 }
 
-macro_rules! map_not_empty {
-    ($StrName: ident, $Expr: expr) => {
-        if !$StrName.is_empty() {
-            Some($Expr)
-        } else {
-            None
-        }
-    }
-}
-
 fn parse_rmc(input: &str) -> Result<RmcData, &'static str> {
     let mut field = input.split(",");
     if !REGEX_RMC_HEAD.is_match(field.next().ok_or("parse_rmc failed: non RMC type")?) {
@@ -350,15 +354,7 @@ fn parse_rmc(input: &str) -> Result<RmcData, &'static str> {
     }
     let time = field.next().ok_or("parse_rmc failed: no time")?;
     let time: Option<NaiveTime> = map_not_empty!(time, {
-        if time.len() < 6 {
-            return Err("parse_rmc: text field with time too short (< 6 symbols)");
-        } else {
-            let hours = Nmea::parse_numeric::<u8>(&time[0..2], 1)?;
-            let mins = Nmea::parse_numeric::<u8>(&time[2..4], 1)?;
-            let secs = Nmea::parse_numeric::<f32>(&time[4..], 1.0)?;
-            NaiveTime::from_hms_nano(hours as u32, mins as u32, secs.floor() as u32,
-                                      (secs.fract() * 1_000_000_000f32) as u32)
-        }
+        Nmea::parse_hms(time)?
     });
 
     let status_of_fix = field.next().ok_or("parse_rmc failed: no status of fix")?;
@@ -369,28 +365,7 @@ fn parse_rmc(input: &str) -> Result<RmcData, &'static str> {
         _ => { return Err("parse_rmc failed: not A|D|V status of fix"); }
     });
 
-    let lat = field.next().ok_or("parse_rmc failed: no lattitude")?;
-    let lat_dir = match field.next().ok_or("parse_rmc failed: no lattitude direction")? {
-        "S" => -0.01,
-        "N" => 0.01,
-        _ => { return Err("parse_rmc failed: wrong lat dir, not of S|N"); }
-    };
-    let lat = map_not_empty!(lat, {
-        let num = Nmea::parse_numeric::<f32>(lat, lat_dir)?;
-        num.round() + (num.fract() * 100.0) / 60.
-    });
-
-    let lon = field.next().ok_or("parse_rmc failed: no longitude")?;
-    let lon_dir = match field.next().ok_or("parse_rmc failed: no longitude direction")? {
-        "W" => -0.01,
-        "E" => 0.01,
-        _ => { return Err("parse_rmc failed: wrong lon dir"); }
-    };
-    let lon = map_not_empty!(lon, {
-       let num = Nmea::parse_numeric::<f32>(lon, lon_dir)?;
-        num.round() + (num.fract() * 100.0) / 60.
-    });
-
+    let (lat, lon) = parse_lat_lon(&mut field)?;
 
     let speed_over_ground = field.next().ok_or("parse_rmc failed: no speed over ground")?;
     let speed_over_ground = map_not_empty!(speed_over_ground, Nmea::parse_numeric::<f32>(speed_over_ground, 1.0)?);
@@ -420,6 +395,32 @@ fn parse_rmc(input: &str) -> Result<RmcData, &'static str> {
         speed_over_ground: speed_over_ground,
         true_course: course,
     })
+}
+
+fn parse_lat_lon<'a>(field: &mut Iterator<Item = &'a str>) -> Result<(Option<f32>, Option<f32>), &'static str> {
+    let lat = field.next().ok_or("parse_rmc failed: no lattitude")?;
+    let lat_dir = match field.next().ok_or("parse_rmc failed: no lattitude direction")? {
+        "S" => -0.01,
+        "N" => 0.01,
+        _ => { return Err("parse_rmc failed: wrong lat dir, not of S|N"); }
+    };
+    let lat = map_not_empty!(lat, {
+        let num = Nmea::parse_numeric::<f32>(lat, lat_dir)?;
+        num.round() + (num.fract() * 100.0) / 60.
+    });
+
+    let lon = field.next().ok_or("parse_rmc failed: no longitude")?;
+    let lon_dir = match field.next().ok_or("parse_rmc failed: no longitude direction")? {
+        "W" => -0.01,
+        "E" => 0.01,
+        _ => { return Err("parse_rmc failed: wrong lon dir"); }
+    };
+    let lon = map_not_empty!(lon, {
+       let num = Nmea::parse_numeric::<f32>(lon, lon_dir)?;
+        num.round() + (num.fract() * 100.0) / 60.
+    });
+
+    Ok((lat, lon))
 }
 
 impl fmt::Debug for Nmea {
@@ -731,9 +732,8 @@ lazy_static! {
     static ref REGEX_TYPE: Regex = {
         Regex::new(r"^\$\D{2}(?P<type>\D{3}).*$").unwrap()
     };
-
-    static ref REGEX_GGA: Regex = {
-        Regex::new(r"^\$\D\DGGA,(?P<timestamp>\d{6})\.?\d*,(?P<lat>\d+\.\d+),(?P<lat_dir>[NS]),(?P<lon>\d+\.\d+),(?P<lon_dir>[WE]),(?P<fix_type>\d),(?P<fix_satellites>\d+),(?P<hdop>\d+\.\d+),(?P<alt>\d+\.\d+),\D,(?P<geoid_height>\d+\.\d+),\D,,\*([0-9a-fA-F][0-9a-fA-F])").unwrap()
+    static ref REGEX_GGA_HEAD: Regex = {
+          Regex::new(r"^\$\D\DGGA").unwrap()
     };
     static ref REGEX_GSV: Regex = {
         Regex::new(r"^\$(?P<type>\D\D)GSV,(?P<number>\d+),(?P<index>\d+),(?P<sat_num>\d+),(?P<sats>.*)\*\d\d$").unwrap()
@@ -853,6 +853,13 @@ fn test_gga_gps() {
     assert_eq!(1.03, nmea.hdop.unwrap());
     assert_eq!(61.7, nmea.altitude.unwrap());
     assert_eq!(55.2, nmea.geoid_height.unwrap());
+}
+
+#[test]
+fn test_gga_frac_sec_time() {
+    let mut nmea = Nmea::new();
+    nmea.parse("$GPGGA,153059.6,5650.14446,N,03546.34238,E,0,00,,,M,,M,,*41").unwrap();
+    assert_eq!(NaiveTime::from_hms_milli(15, 30, 59, 600), nmea.fix_timestamp_time.unwrap());
 }
 
 #[test]
