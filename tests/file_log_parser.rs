@@ -25,7 +25,7 @@ fn test_parse_file_log() {
 fn test_parse_issue_2() {
     let mut input =
         BufReader::new(File::open(&Path::new("tests").join("data").join("nmea2.log")).unwrap());
-    let mut nmea = Nmea::new();
+    let mut nmea = Nmea::default();
     for _ in 0..100 {
         let mut buffer = String::new();
         let size = input.read_line(&mut buffer).unwrap();
@@ -53,8 +53,8 @@ fn test_full_parse_of_nmea_with_sat_info() {
         println!("test parsing of {log_path:?}");
         let full_log = fs::read_to_string(&log_path).unwrap();
 
-        let mut nmea1 = Nmea::new();
-        let mut nmea2 = Nmea::new();
+        let mut nmea1 = Nmea::default();
+        let mut nmea2 = Nmea::default();
 
         for line in full_log.lines() {
             let s = line.as_bytes();
@@ -71,7 +71,7 @@ fn err_to_string<E: Error>(e: E) -> String {
 
 fn process_file(n: &Path) -> Result<Vec<String>, String> {
     let input = BufReader::new(File::open(n).map_err(err_to_string)?);
-    let mut nmea = nmea::Nmea::new();
+    let mut nmea = nmea::Nmea::default();
     let mut ret = Vec::with_capacity(15_000);
     for (num, line) in input.lines().enumerate() {
         let line = line
