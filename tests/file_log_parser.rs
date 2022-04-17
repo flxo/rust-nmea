@@ -56,11 +56,22 @@ fn test_full_parse_of_nmea_with_sat_info() {
         let mut nmea1 = Nmea::default();
         let mut nmea2 = Nmea::default();
 
-        for line in full_log.lines() {
+        for (line_no, line) in full_log.lines().enumerate() {
             let s = line.as_bytes();
-            parse(s).unwrap();
-            nmea1.parse(line).unwrap();
-            nmea2.parse_for_fix(s).unwrap();
+
+            macro_rules! err_handler {
+                () => {
+                    |err| {
+                        panic!(
+                            "Parsing of {line} at {log_path:?}:{line_no} failed: {err}",
+                            line_no = line_no + 1
+                        )
+                    }
+                };
+            }
+            parse(s).unwrap_or_else(err_handler!());
+            nmea1.parse(line).unwrap_or_else(err_handler!());
+            nmea2.parse_for_fix(s).unwrap_or_else(err_handler!());
         }
     }
 }

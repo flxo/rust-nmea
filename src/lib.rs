@@ -29,6 +29,7 @@ pub use crate::parse::{
 };
 use chrono::{NaiveDate, NaiveTime};
 use core::{fmt, iter::Iterator, mem, ops::BitOr};
+use parse::NavigationStatus;
 use std::collections::HashMap;
 
 /// NMEA parser
@@ -237,6 +238,19 @@ impl<'a> Nmea {
         self.true_course = rmc_data.true_course;
     }
 
+    fn merge_gns_data(&mut self, gns_data: parse::GnsData) {
+        self.fix_time = gns_data.fix_time;
+        self.fix_type = Some(match gns_data.nav_status {
+            NavigationStatus::Safe => FixType::Gps,
+            _ => FixType::Invalid,
+        });
+        self.latitude = gns_data.lat;
+        self.longitude = gns_data.lon;
+        self.altitude = gns_data.alt;
+        self.hdop = self.hdop;
+        self.geoid_separation = gns_data.geoid_separation;
+    }
+
     fn merge_gsa_data(&mut self, gsa: GsaData) {
         self.fix_satellites_prns = Some(gsa.fix_sats_prn);
         self.hdop = gsa.hdop;
@@ -278,6 +292,10 @@ impl<'a> Nmea {
             ParseResult::RMC(rmc) => {
                 self.merge_rmc_data(rmc);
                 Ok(SentenceType::RMC)
+            }
+            ParseResult::GNS(gns) => {
+                self.merge_gns_data(gns);
+                Ok(SentenceType::GNS)
             }
             ParseResult::GSA(gsa) => {
                 self.merge_gsa_data(gsa);
@@ -355,6 +373,27 @@ impl<'a> Nmea {
                 }
                 self.merge_rmc_data(rmc_data);
                 self.sentences_for_this_time.insert(SentenceType::RMC);
+            }
+            ParseResult::GNS(gns_data) => {
+                if gns_data.nav_status != NavigationStatus::Safe {
+                    self.clear_position_info();
+                    return Ok(FixType::Invalid);
+                }
+                match (self.last_fix_time, gns_data.fix_time) {
+                    (Some(ref last_fix_time), Some(ref gns_fix_time)) => {
+                        if *last_fix_time != *gns_fix_time {
+                            self.new_tick();
+                            self.last_fix_time = Some(*gns_fix_time);
+                        }
+                    }
+                    (None, Some(ref gns_fix_time)) => self.last_fix_time = Some(*gns_fix_time),
+                    (Some(_), None) | (None, None) => {
+                        self.clear_position_info();
+                        return Ok(FixType::Invalid);
+                    }
+                }
+                self.merge_gns_data(gns_data);
+                self.sentences_for_this_time.insert(SentenceType::GNS);
             }
             ParseResult::GGA(gga_data) => {
                 match gga_data.fix_type {
